@@ -8,32 +8,30 @@ import uuid
 import hashlib
 import requests
 from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
 import jwt
 
-# Environment variables
-MONGO_URL = os.environ.get('MONGO_URL')
-DB_NAME = os.environ.get('DB_NAME', 'convotalk_db')
-JWT_SECRET = os.environ.get('JWT_SECRET', 'change-this-secret-key')
-GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
-GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://votre-domaine.com')
+load_dotenv()
 
 # MongoDB connection
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get('DB_NAME', 'convotalk_db')]
+
+# JWT Configuration
+JWT_SECRET = os.environ.get('JWT_SECRET', 'change-this-secret-key')
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24 * 7
 
 # FastAPI app
-app = FastAPI(
-    title="ConvoTalk API",
-    description="API pour ConvoTalk - Alternative Discord",
-    version="1.0.0"
-)
+app = FastAPI(title="ConvoTalk API")
+api_router = APIRouter(prefix="/api")
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],  # En production, spécifier votre domaine
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -86,13 +84,13 @@ def create_jwt_token(user_id: str, email: str, username: str) -> str:
         "user_id": user_id,
         "email": email,
         "username": username,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=24 * 7)
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def verify_jwt_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return payload
     except:
         return None
@@ -107,9 +105,13 @@ async def get_current_user(request: Request) -> Optional[dict]:
 # Routes
 @app.get("/")
 async def root():
-    return {"message": "ConvoTalk API", "version": "1.0", "status": "running"}
+    return {"message": "ConvoTalk API is running"}
 
-@app.post("/api/auth/register")
+@api_router.get("/")
+async def api_root():
+    return {"message": "ConvoTalk API v1.0", "status": "running"}
+
+@api_router.post("/auth/register")
 async def register(user_data: UserRegister):
     existing_user = await db.users.find_one({
         "$or": [{"email": user_data.email}, {"username": user_data.username}]
@@ -117,7 +119,7 @@ async def register(user_data: UserRegister):
     
     if existing_user:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email ou nom d'utilisateur déjà utilisé"
         )
     
@@ -144,12 +146,12 @@ async def register(user_data: UserRegister):
         "token": token
     }
 
-@app.post("/api/auth/login")
+@api_router.post("/auth/login")
 async def login(user_data: UserLogin):
     user = await db.users.find_one({"email": user_data.email})
     if not user or not verify_password(user_data.password, user["password"]):
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email ou mot de passe incorrect"
         )
     
@@ -166,21 +168,19 @@ async def login(user_data: UserLogin):
         "token": token
     }
 
-@app.get("/api/auth/google")
-async def google_login(redirect_url: str = None):
-    if not redirect_url:
-        redirect_url = f"{FRONTEND_URL}/auth/callback"
-    
+@api_router.get("/auth/google")
+async def google_login(redirect_url: str = "http://localhost:3000/chat"):
+    google_client_id = os.environ.get('GOOGLE_CLIENT_ID')
     auth_url = (
         f"https://accounts.google.com/o/oauth2/v2/auth"
-        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"?client_id={google_client_id}"
         f"&redirect_uri={redirect_url}"
         f"&response_type=code"
         f"&scope=openid email profile"
     )
     return {"auth_url": auth_url}
 
-@app.post("/api/auth/google/callback")
+@api_router.post("/auth/google/callback")
 async def google_callback(request: Request):
     body = await request.json()
     code = body.get("code")
@@ -190,13 +190,14 @@ async def google_callback(request: Request):
     
     try:
         token_url = "https://oauth2.googleapis.com/token"
+        frontend_url = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
         
         token_data = {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
+            "client_id": os.environ.get('GOOGLE_CLIENT_ID'),
+            "client_secret": os.environ.get('GOOGLE_CLIENT_SECRET'),
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": f"{FRONTEND_URL}/auth/callback"
+            "redirect_uri": f"{frontend_url}/auth/callback"
         }
         
         token_response = requests.post(token_url, data=token_data)
@@ -239,7 +240,7 @@ async def google_callback(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/api/auth/me")
+@api_router.get("/auth/me")
 async def get_current_user_info(request: Request):
     current_user = await get_current_user(request)
     if not current_user:
@@ -257,7 +258,7 @@ async def get_current_user_info(request: Request):
         "is_online": user.get("is_online", False)
     }
 
-@app.get("/api/channels")
+@api_router.get("/channels")
 async def get_channels(request: Request):
     current_user = await get_current_user(request)
     if not current_user:
@@ -273,7 +274,7 @@ async def get_channels(request: Request):
         result.append(channel)
     return result
 
-@app.get("/api/channels/{channel_id}/messages")
+@api_router.get("/channels/{channel_id}/messages")
 async def get_messages(channel_id: str, request: Request):
     current_user = await get_current_user(request)
     if not current_user:
@@ -289,7 +290,7 @@ async def get_messages(channel_id: str, request: Request):
         result.append(message)
     return result
 
-@app.post("/api/channels/{channel_id}/messages")
+@api_router.post("/channels/{channel_id}/messages")
 async def send_message(channel_id: str, request: Request):
     current_user = await get_current_user(request)
     if not current_user:
@@ -315,7 +316,7 @@ async def send_message(channel_id: str, request: Request):
     
     return message_dict
 
-@app.get("/api/users/online")
+@api_router.get("/users/online")
 async def get_online_users(request: Request):
     current_user = await get_current_user(request)
     if not current_user:
@@ -346,6 +347,9 @@ async def startup_event():
         )
         await db.channels.insert_one(channel.model_dump())
 
-# Vercel handler
-def handler(request, context):
-    return app(request, context)
+app.include_router(api_router)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port)
